@@ -1,285 +1,181 @@
-#TODO: больше обработки ошибок для повышения стабильности;
-#      уменьшение количества операций над строками для повышения производительности;
-#      неблокирующие или параллельные ввод-вывод и обновление погоды;
-#      сохранение данных о погоде локально.
+# WeatherClock.py
 import serial
-import os, datetime, time, requests
+import os, datetime, time, requests, json, threading
 from dotenv import load_dotenv
-# import usb.core
-# import usb.util
 
-WEATHER_UPDATE_INTERVAL = 3000
+# Константы
+WEATHER_UPDATE_INTERVAL = 3000 
+CACHE_FILE_CURRENT = 'weather_current.json'
+CACHE_FILE_FORECAST = 'weather_forecast.json'
 
+# Глобальные переменные
+weather_text_bytes = b'T???C P???mm H??%'.ljust(20)
+weather_conditions_bytes = b''
+is_updating = False
 
-def GetWeather(id = 503978):
+def SaveCache(data, filename):
     try:
-        load_dotenv()
-        api_key = os.getenv('OPENWEATHER_API_KEY')
-        if not api_key:
-            print("Ошибка: API-ключ не найден в переменных окружения или файле .env")
-            return None
-        res = requests.get("http://api.openweathermap.org/data/2.5/weather",
-            params={'q': 'Moscow', 'units': 'metric', 'APPID': api_key, 'lang' : 'ru'},
-            timeout=30)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.HTTPError as errh:
-        print ("Http Error:", errh)
-    except requests.exceptions.ConnectionError as errc:
-        print ("Error Connecting:", errc)
-    except requests.exceptions.Timeout as errt:
-        print ("Timeout Error:", errt)
-    except Exception as exc:
-        print("Exception (weather):", exc)
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Ошибка сохранения кэша {filename}: {e}")
+
+def LoadCache(filename):
+    if not os.path.exists(filename): return None
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Ошибка чтения кэша {filename}: {e}")
         return None
 
+def WindConvert(angle=None):
+    if angle is None: return ''
+    try:
+        direction = ['северный', 'северо-северо-восточный', 'северо-северо-восточный', 'северо-восточный',
+                     'северо-восточный', 'восточно-северо-восточный', 'восточно-северо-восточный', 'восточный',
+                     'восточный', 'восточно-юго-восточный', 'восточно-юго-восточный', 'юго-восточный',
+                     'юго-восточный', 'юго-юго-восточный', 'юго-юго-восточный', 'южный', 'южный',
+                     'юго-юго-западный', 'юго-юго-западный', 'юго-западный', 'юго-западный', 'западно-юго-западный',
+                     'западно-юго-западный', 'западный', 'западный', 'западно-северо-западный', 'западно-северо-западный',
+                     'северо-западный', 'северо-западный', 'северо-северо-западный', 'северо-северо-западный', 'северный', 'северный']
+        return direction[int(angle // 11.25)]
+    except: return str(angle) + ' град'
 
-def TestDisplayCharacters():
-    test = bytearray (b'\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0')
-    for i in range (255):
-        for j in range(20):
-            test[j] = i
-        port.write (test)
-        port.write (test)
-        print('%03d\t%02X' % i, i)
-        os.system('pause')
-
-def WindConvert(angle = None):
-    windDirection = ''
-    if angle is not None:
-        try:
-            direction = ['северный',  # [0-11.25)
-                         'северо-северо-восточный',  # [11.25-22.5)
-                         'северо-северо-восточный',  # [22.5-33.75)
-                         'северо-восточный',
-                         'северо-восточный',
-                         'восточно-северо-восточный',
-                         'восточно-северо-восточный',
-                         'восточный',
-                         'восточный',
-                         'восточно-юго-восточный',
-                         'восточно-юго-восточный',
-                         'юго-восточный',
-                         'юго-восточный',
-                         'юго-юго-восточный',
-                         'юго-юго-восточный',
-                         'южный',
-                         'южный',
-                         'юго-юго-западный',
-                         'юго-юго-западный',
-                         'юго-западный',
-                         'юго-западный',
-                         'западно-юго-западный',
-                         'западно-юго-западный',
-                         'западный',
-                         'западный',
-                         'западно-северо-западный',
-                         'западно-северо-западный',
-                         'северо-западный',
-                         'северо-западный',
-                         'северо-северо-западный',
-                         'северо-северо-западный',
-                         'северный',
-                         'северный']
-            directionIndex = int(angle//11.25)
-            windDirection = direction[directionIndex]
-        except Exception as exc:
-            print('Ошибка при конвертации угла в румбы ветра. Текст исключения: ', exc)
-            return str(angle)+' градусов'
-        else:
-            return windDirection
-
-def __UNITTEST__WindConvert():
-    for i in range(361):
-        print(i, WindConvert(i))
-
-
-def UTFToASCIIPosUA(string=None):     # posua - таблица латиницы [128 - 159] (заглавные) и { [160-175] - [224-239] }
-                                      # (прописные) последовательно (АБВГД)(!!!БЕЗ БУКВЫ 'Ё'!!!)
-    result = None
-    charDict = {'А': b'\x80',  'а': b'\xA0',      'Q': b'Q', 'q': b'q',
-                'Б': b'\x81',  'б': b'\xA1',      'W': b'W', 'w': b'w',
-                'В': b'\x82',  'в': b'\xA2',      'E': b'E', 'e': b'e',
-                'Г': b'\x83',  'г': b'\xA3',      'R': b'R', 'r': b'r',
-                'Д': b'\x84',  'д': b'\xA4',      'T': b'T', 't': b't',
-                'Е': b'\x85',  'е': b'\xA5',      'Y': b'Y', 'y': b'y',
-                'Ё': b'\x85',  'ё': b'\xA5',      'U': b'U', 'u': b'u',
-                'Ж': b'\x86',  'ж': b'\xA6',      'I': b'I', 'i': b'i',
-                'З': b'\x87',  'з': b'\xA7',      'O': b'O', 'o': b'o',
-                'И': b'\x88',  'и': b'\xA8',      'P': b'P', 'p': b'p',
-                'Й': b'\x89',  'й': b'\xA9',      'A': b'A', 'a': b'a',
-                'К': b'\x8A',  'к': b'\xAA',      'S': b'S', 's': b's',
-                'Л': b'\x8B',  'л': b'\xAB',      'D': b'D', 'd': b'd',
-                'М': b'\x8C',  'м': b'\xAC',      'F': b'F', 'f': b'f',
-                'Н': b'\x8D',  'н': b'\xAD',      'G': b'G', 'g': b'g',
-                'О': b'\x8E',  'о': b'\xAE',      'H': b'H', 'h': b'h',
-                'П': b'\x8F',  'п': b'\xAF',      'J': b'J', 'j': b'j',
-                'Р': b'\x90',  'р': b'\xE0',      'K': b'K', 'k': b'k',
-                'С': b'\x91',  'с': b'\xE1',      'L': b'L', 'l': b'l',
-                'Т': b'\x92',  'т': b'\xE2',      'Z': b'Z', 'z': b'z',
-                'У': b'\x93',  'у': b'\xE3',      'X': b'X', 'x': b'x',
-                'Ф': b'\x94',  'ф': b'\xE4',      'C': b'C', 'c': b'c',
-                'Х': b'\x95',  'х': b'\xE5',      'V': b'V', 'v': b'v',
-                'Ц': b'\x96',  'ц': b'\xE6',      'B': b'B', 'b': b'b',
-                'Ч': b'\x97',  'ч': b'\xE7',      'N': b'N', 'n': b'n',
-                'Ш': b'\x98',  'ш': b'\xE8',      'M': b'M', 'm': b'm',
-                'Щ': b'\x99',  'щ': b'\xE9',
-                'Ь': b'\x9A',  'ь': b'\xEA',
-                'Ы': b'\x9B',  'ы': b'\xEB',
-                'Ъ': b'\x9C',  'ъ': b'\xEC',
-                'Э': b'\x9D',  'э': b'\xED',
-                'Ю': b'\x9E',  'ю': b'\xEE',
-                'Я': b'\x9F',  'я': b'\xEF',
-                ' ': b' '   ,  ':': b'\x3A',
-                '/': b'/'   ,  '.': b'.',
-                ',': b','   ,  ';': b';',
-                "'": b"'"   ,  '"': b'"',
-                '-': b'-'}
-    
-    if string != None:
-        result = bytearray([charDict[string[i]][0]   for i in range(len(string))])#
-    return result
-
+def UTFToASCIIPosUA(string=None):
+    if string is None: return b''
+    charDict = {'А': b'\x80', 'а': b'\xA0', 'Б': b'\x81', 'б': b'\xA1', 'В': b'\x82', 'в': b'\xA2', 'Г': b'\x83', 'г': b'\xA3',
+                'Д': b'\x84', 'д': b'\xA4', 'Е': b'\x85', 'е': b'\xA5', 'Ё': b'\x85', 'ё': b'\xA5', 'Ж': b'\x86', 'ж': b'\xA6',
+                'З': b'\x87', 'з': b'\xA7', 'И': b'\x88', 'и': b'\xA8', 'Й': b'\x89', 'й': b'\xA9', 'К': b'\x8A', 'к': b'\xAA',
+                'Л': b'\x8B', 'л': b'\xAB', 'М': b'\x8C', 'м': b'\xAC', 'Н': b'\x8D', 'н': b'\xAD', 'О': b'\x8E', 'о': b'\xAE',
+                'П': b'\x8F', 'п': b'\xAF', 'Р': b'\x90', 'р': b'\xE0', 'С': b'\x91', 'с': b'\xE1', 'Т': b'\x92', 'т': b'\xE2',
+                'У': b'\x93', 'у': b'\xE3', 'Ф': b'\x94', 'ф': b'\xE4', 'Х': b'\x95', 'х': b'\xE5', 'Ц': b'\x96', 'ц': b'\xE6',
+                'Ч': b'\x97', 'ч': b'\xE7', 'Ш': b'\x98', 'ш': b'\xE8', 'Щ': b'\x99', 'щ': b'\xE9', 'Ь': b'\x9A', 'ь': b'\xEA',
+                'Ы': b'\x9B', 'ы': b'\xEB', 'Ъ': b'\x9C', 'ъ': b'\xEC', 'Э': b'\x9D', 'э': b'\xED', 'Ю': b'\x9E', 'ю': b'\xEE',
+                'Я': b'\x9F', 'я': b'\xEF', ' ': b' ', ':': b'\x3A', '/': b'/', '.': b'.', ',': b',', ';': b';', "'": b"'", '"': b'"', '-': b'-'}
+    res = []
+    for char in string:
+        res.append(charDict.get(char, char.encode('ascii', errors='ignore'))[0])
+    return bytearray(res)
 
 def FormatWeatherData(weather):
-    if weather is not None:
-        print (weather)
-        temperature = None
-        pressure = None
-        pressure = None
-        humidity = None
-        conditions = None
-        try:
-            temperature = weather['main']['temp']
-            pressure = weather['main']['pressure']
-            pressure = pressure/1.33333
-            humidity = weather['main']['humidity']
-            conditions = weather['weather'][0]['description']
-            wind = weather['wind']['speed']
-            if 'deg' in weather['wind']:
-                windDeg = weather['wind']['deg']
-            else:
-                windDeg = 0
-        except Exception as exc:
-            print('Ошибка JSON.')
-            textWeather = b'T???C P???mm H??%'
-            textWeather = textWeather.ljust(20, b' ')
-            conditions = UTFToASCIIPosUA('Ошибка доступа по ключу к элементам загруженного ')
-            conditions += str('JSON-').encode('ascii') + UTFToASCIIPosUA('файла. Текст исключения: ')
-            conditions += str(exc.with_traceback).encode('ascii') + str(exc).encode('ascii')
-            print(exc.with_traceback, exc)
-        else:
-            temperature = str(temperature).encode ('ascii')
-            pressure = str(pressure)[0:3].encode ('ascii')
-            humidity = str(humidity).encode ('ascii')
-            wind = str(wind).encode ('ascii')
-            windDirection = UTFToASCIIPosUA(WindConvert(windDeg))
-            conditions = UTFToASCIIPosUA(conditions) + b'; ' + UTFToASCIIPosUA('ветер ') + windDirection + b', ' + wind + UTFToASCIIPosUA(' м/с')
-            celsium = bytearray(b'C ')
-            textWeather = b'T' + temperature[0:4] + celsium + b'P' + pressure + b'mm ' + b'H' + humidity + b'%'
-            textWeather = textWeather.ljust(20, b' ')
-    else:
-        textWeather = b'T???C P???mm H??%'
-        textWeather = textWeather.ljust(20, b' ')
-        conditions  = UTFToASCIIPosUA('Не удаётся подключиться к ресурсу ') + b'"http://api.openweathermap.org/". ' + UTFToASCIIPosUA('Отсутствует подключение к интернету')
-    return textWeather, conditions
+    try:
+        temp = weather['main']['temp']
+        press = int(weather['main']['pressure'] / 1.33333)
+        hum = weather['main']['humidity']
+        desc = weather['weather'][0]['description']
+        wind = weather['wind']['speed']
+        wind_deg = weather['wind'].get('deg', 0)
 
+        # Формируем строку: T +0.0C P760mm H50%
+        temp_str = f"{temp:+.1f}"
+        line1 = f"T {temp_str}C P{press}mm H{hum}%".encode('ascii').ljust(20)
+        line2 = UTFToASCIIPosUA(f"{desc}; ветер {WindConvert(wind_deg)}, {wind} м/с")
+        return line1, line2
+    except Exception as e:
+        print(f"Ошибка форматирования: {e}")
+        return b'T???C P???mm H??%'.ljust(20), UTFToASCIIPosUA("Ошибка данных")
+
+def GetWeatherSync():
+    load_dotenv()
+    api_key = os.getenv('OPENWEATHER_API_KEY')
+    proxies = {"http": None, "https": None}
+    
+    data = None
+    try:
+        r = requests.get("https://api.openweathermap.org/data/2.5/weather", 
+                        params={'q': 'Moscow', 'units': 'metric', 'APPID': api_key, 'lang': 'ru'}, 
+                        timeout=10, proxies=proxies)
+        if r.status_code == 200:
+            data = r.json()
+            SaveCache(data, CACHE_FILE_CURRENT)
+            print("API: Текущая погода обновлена")
+            
+            # Запрашиваем только 12 точек (на 36 часов вперед)
+            rf = requests.get("https://api.openweathermap.org/data/2.5/forecast", 
+                             params={'q': 'Moscow', 'units': 'metric', 'APPID': api_key, 'lang': 'ru', 'cnt': 12}, 
+                             timeout=10, proxies=proxies)
+            if rf.status_code == 200:
+                SaveCache(rf.json(), CACHE_FILE_FORECAST)
+                print("API: Прогноз на 36 часов обновлен")
+    except Exception as e:
+        print(f"Ошибка API: {e}")
+
+    if not data:
+        current = LoadCache(CACHE_FILE_CURRENT)
+        forecast = LoadCache(CACHE_FILE_FORECAST)
+        if current:
+            data = current
+            print("КЭШ: Использую текущую погоду")
+        if forecast and 'list' in forecast:
+            now = time.time()
+            best = min(forecast['list'], key=lambda x: abs(x['dt'] - now))
+            if not data or abs(best['dt'] - now) < 3600:
+                data = best
+                print(f"КЭШ: Взят прогноз (разница {int(abs(best['dt']-now)/60)} мин)")
+    return data
+
+def UpdateWeatherTask():
+    global weather_text_bytes, weather_conditions_bytes, is_updating
+    if is_updating: return
+    is_updating = True
+    try:
+        data = GetWeatherSync()
+        if data:
+            weather_text_bytes, weather_conditions_bytes = FormatWeatherData(data)
+    finally:
+        is_updating = False
 
 if __name__ == '__main__':
-    found = False
-    grad = bytearray(b'\0')
-    grad[0] = 223
-    floatingFlag = False
+    port = serial.Serial("COM1", 9600, timeout=0)
+    threading.Thread(target=UpdateWeatherTask, daemon=True).start()
+    
+    i_weather = 0 # Счетчик для обновления из интернета (5 мин)
+    i_scroll = 0  # Счетчик для паузы между прокрутками (20 сек)
     fBegin = 0
-    #foundPort = ' '
-    #for i in range(64) :
-    #    try :
-    #        prt = "COM%d" % 99 # i
-    #        ser = serial.Serial(prt)
-    #        ser.close()
-    #        print ("Найден последовательный порт: ", prt)
-    #        foundPort = prt
-    #        found = True
-    #    except serial.serialutil.SerialException :
-    #        pass
-    #os.system('pause')
-    #if not found :
-    #    print ("Последовательных портов не обнаружено")
-    #    pass
-    #else:
-    #    port = serial.Serial(foundPort, 9600, timeout=0)
-    #    print ("порт открыт")
-    #    i = 0
-    i = 0
-    port = serial.Serial("COM%d" % 1, 9600, timeout=0)
-    #TestDisplayCharacters ()
-    #os.system('pause')
-    weather = GetWeather()
-    textWeather, conditions = FormatWeatherData(weather)
-    lString = textWeather
+    floatingFlag = False
+    
     while True:
-        currentTime = datetime.datetime.now()
-        ms = str(currentTime.microsecond)
-        h = str(currentTime.hour)
-        m = str(currentTime.minute)
-        s = str(currentTime.second)
-        day = str(currentTime.day)
-        month = str(currentTime.month)
-        year  = str(currentTime.year)
-        if len(h) == 1:
-            h = '0' + h
-        if len(m) == 1:
-            m = '0' + m
-        if len(s) == 1:
-            s = '0' + s
-        if len(day) == 1:
-            day = '0' + day
-        if len(month) == 1:
-            month = '0' + month
-        s = s.encode('ascii')
-        m = m.encode('ascii')
-        h = h.encode('ascii')
-        ms = ms.encode('ascii')
-        day = day.encode('ascii')
-        month = month.encode('ascii')
-        year = year.encode('ascii')
-        # форматирование верхней строки даты/времени
-        i+=1
-        date = day + b'.' + month + b'.' + year[2:4]
-        hString = date.ljust(10, b' ')
-        tm = h + b':' + m + b':' + s
-        hString += tm + b'.' + ms[0:1]
-        # обработка "плавающей" строки с погодными условиями
-        if floatingFlag == True:
-            if i % 1 == 0:
-                if (len(conditions) + 48) > (20 + fBegin):
-                    lString = (textWeather + b'  ' + conditions + 5*b' ' + textWeather)[fBegin:20+fBegin]
-                    lString = lString.ljust(20, b' ')
-                    fBegin += 1
-                else:
-                    fBegin = 1
-                    floatingFlag = False
-        else:
-            if fBegin == 1:
-                lString = textWeather
+        # 1. Часы (верхняя строка)
+        now = datetime.datetime.now()
+        hString = now.strftime("%d.%m.%y  %H:%M:%S.%f")[:20].encode('ascii')
+        
+        # 2. Логика бегущей строки (нижняя строка)
+        if floatingFlag:
+            clean_temp = weather_text_bytes.strip()
+            scroll_source = clean_temp + b'    ' + weather_conditions_bytes + b'     ' + clean_temp
+            rawL = scroll_source[fBegin:20+fBegin]
+            
+            # Проверка завершения прокрутки
+            if fBegin > 10 and rawL.startswith(clean_temp):
+                floatingFlag = False
                 fBegin = 0
+                i_scroll = 0 # Сбрасываем только счетчик паузы!
+                lString = clean_temp.ljust(20)
             else:
-                if i % 150 == 0:
-                    if lString == textWeather:
-                        lString = (textWeather + conditions)[fBegin:20+fBegin]
-                        floatingFlag = True
-                    else:
-                        lString = textWeather
-        if i == WEATHER_UPDATE_INTERVAL: # weather update
-            i = 0
-            os.system ('cls')
-            weather = GetWeather() #print(weather)
-            textWeather, conditions = FormatWeatherData(weather)
-            lString = textWeather
+                lString = rawL.ljust(20)
+                fBegin += 1
+        else:
+            i_scroll += 1
+            lString = weather_text_bytes.strip().ljust(20)
+            
+            # Начинаем прокрутку через 20 секунд
+            if i_scroll >= 200:
+                if len(weather_conditions_bytes) > 0:
+                    floatingFlag = True
+                    fBegin = 1
+                else:
+                    i_scroll = 0
+
+        # 3. Обновление погоды из интернета (каждые 5 минут)
+        i_weather += 1
+        if i_weather >= WEATHER_UPDATE_INTERVAL:
+            i_weather = 0
+            threading.Thread(target=UpdateWeatherTask, daemon=True).start()
+
         try:
             port.write(hString + lString)
-        except serial.serialutil.SerialTimeoutException as exc:
-            print(exc)
-        except serial.serialutil.SerialException as exc:
-            print(exc)
+        except Exception as e:
+            print(f"Ошибка порта: {e}")
+            
         time.sleep(0.1)
