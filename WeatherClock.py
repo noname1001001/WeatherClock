@@ -33,7 +33,7 @@ def Log(msg):
     print(f"[{datetime.datetime.now()}] {msg}", flush=True)
 
 def LoadEnv(path=None):
-    Мини-парсер .env.
+    #Мини-парсер .env.
     path = path or (SCRIPT_DIR / '.env')
     res = {}
     try:
