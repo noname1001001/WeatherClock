@@ -28,12 +28,15 @@ SOURCES = ['openweathermap', 'open-meteo', 'met.no']
 # Глобальные переменные
 weather_text_bytes = b'T???C P???mm H??%'.ljust(20)
 weather_conditions_bytes = b''
+# Обе строки всегда читаются/пишутся парой: без блокировки поток дисплея мог
+# увидеть новую температуру и старую погоду одновременно (см. историю с пустой строкой)
+weather_lock = threading.Lock()
 
 def Log(msg):
     print(f"[{datetime.datetime.now()}] {msg}", flush=True)
 
 def LoadEnv(path=None):
-    #Мини-парсер .env.
+    """Мини-парсер .env, чтобы не тянуть python-dotenv."""
     path = path or (SCRIPT_DIR / '.env')
     res = {}
     try:
@@ -53,7 +56,7 @@ def LoadEnv(path=None):
 ENV = LoadEnv()
 
 def Env(name, default=None):
-    #Сначала переменные окружения, затем .env рядом со скриптом.
+    """Сначала переменные окружения, затем .env рядом со скриптом."""
     return os.environ.get(name, ENV.get(name, default))
 
 # Порядок источников можно задать и без правки кода: WEATHER_SOURCES=open-meteo,met.no
@@ -77,18 +80,38 @@ def BuildSession(user_agent):
         session.proxies = {'http': None, 'https': None}
     return session
 
-def GetJSON(session, url, params=None):
-    #GET с проверкой статуса. Возвращает (json, None) либо (None, описание_ошибки).
-    try:
-        r = session.get(url, params=params, timeout=TIMEOUT)
-    except Exception as e:
-        return None, f"{type(e).__name__}: {str(e)[:140]}"
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code} {r.reason}: {r.text[:120].strip()}"
-    try:
-        return r.json(), None
-    except Exception as e:
-        return None, f"некорректный JSON: {e}"
+def GetJSON(session, url, params=None, retries=1):
+    """GET с проверкой статуса; при сетевом сбое или 5xx повторяет один раз.
+
+    Повтор сбрасывает пул соединений: на нестабильном канале keep-alive соединение
+    иногда «зависает» и ловит ReadTimeout раз за разом.
+    Возвращает (json, None) либо (None, описание_ошибки).
+    """
+    last = None
+    for attempt in range(retries + 1):
+        error = None
+        try:
+            r = session.get(url, params=params, timeout=TIMEOUT)
+            if r.status_code == 200:
+                try:
+                    return r.json(), None
+                except Exception as e:
+                    error = f"некорректный JSON: {e}"
+            elif r.status_code in (408, 429, 500, 502, 503, 504) and attempt < retries:
+                error = f"HTTP {r.status_code} {r.reason}"
+            else:
+                return None, f"HTTP {r.status_code} {r.reason}: {r.text[:120].strip()}"
+        except Exception as e:
+            error = f"{type(e).__name__}: {str(e)[:140]}"
+            try:
+                session.close()
+            except Exception:
+                pass
+        last = error
+        if attempt < retries:
+            Log(f"Повтор {attempt + 1}/{retries} после: {error}")
+            time.sleep(2)
+    return None, last
 
 def SaveCache(data, filename):
     try:
@@ -175,6 +198,9 @@ def FormatWeatherData(weather):
         Log(f"Ошибка форматирования: {e}")
         return b'T???C P???mm H??%'.ljust(20), UTFToASCIIPosUA("Ошибка данных")
 
+# --- Источники погоды. Каждый возвращает (текущая_погода, прогноз_список, список_проблем) ---
+# Формат данных — как у OpenWeatherMap: его уже понимает FormatWeatherData.
+
 def MakeWeather(temp, pressure_hpa, humidity, description, wind_ms, wind_deg):
     return {
         'main': {'temp': temp, 'pressure': pressure_hpa, 'humidity': humidity},
@@ -249,6 +275,7 @@ def FetchOpenMeteo():
                 break
     return data, forecast or None, problems
 
+# met.no отдаёт symbol_code вида rain_light_day — берём префикс, самые длинные проверяем первыми
 METNO_SYMBOLS = sorted([
     ('clearsky', 'Ясно'), ('fair', 'Преимущ. ясно'), ('partlycloudy', 'Переменная облачность'),
     ('cloudy', 'Пасмурно'), ('fog', 'Туман'), ('sleet', 'Мокрый снег'), ('snow', 'Снег'),
@@ -270,6 +297,7 @@ def MetNoDescription(symbol_code):
     return code.replace('_', ' ')
 
 def FetchMetNo():
+    # met.no режет запросы без «нормального» User-Agent — отвечает 403
     session = BuildSession(BROWSER_UA)
     raw, err = GetJSON(session, "https://api.met.no/weatherapi/locationforecast/2.0/compact",
                        {'lat': LOC_LAT, 'lon': LOC_LON})
@@ -323,7 +351,7 @@ FETCHERS = {
 }
 
 def FetchFromSources():
-    #Опрос источников по приоритету. Возвращает (есть_текущая_погода, список_проблем).
+    """Опрос источников по приоритету. Возвращает (есть_текущая_погода, список_проблем)."""
     problems = []
     for name in SOURCES:
         fetcher = FETCHERS.get(name)
@@ -347,7 +375,7 @@ def FetchFromSources():
     return False, problems
 
 def PickCachedData():
-    #Выбор данных из кэша. Возвращает (data, возраст, подпись) либо (None, None, причина).
+    """Выбор данных из кэша. Возвращает (data, возраст, подпись) либо (None, None, причина)."""
     current, current_age = LoadCache(CACHE_FILE_CURRENT)
     forecast, forecast_age = LoadCache(CACHE_FILE_FORECAST)
     now = time.time()
@@ -395,18 +423,118 @@ def UpdateOnce():
     return data, age, note, ok
 
 def ApplyToDisplay(data, age, note):
-    #Сбор строк для табло. Делаем это целиком, чтобы поток дисплея не видел «полуправки».
+    """Сбор строк для табло. Обе строки пишем под блокировкой и одним блоком,
+    чтобы поток дисплея не мог увидеть «полуправку»."""
     global weather_text_bytes, weather_conditions_bytes
     if data is None:
-        weather_text_bytes = b'T???C P???mm H??%'.ljust(20)
-        weather_conditions_bytes = bytes(UTFToASCIIPosUA("нет данных с API"))
-        return
-    text, conditions = FormatWeatherData(data)
-    conditions = bytearray(conditions)
-    if age is not None and age > CACHE_STALE_AFTER:
-        conditions += UTFToASCIIPosUA(f"; нет обновлений {FormatAge(age)}")
-        Log(f"ВНИМАНИЕ: данные устарели на {FormatAge(age)} (источник: {note})")
-    weather_text_bytes, weather_conditions_bytes = text, bytes(conditions)
+        text = b'T???C P???mm H??%'.ljust(20)
+        conditions = bytes(UTFToASCIIPosUA("нет данных с API"))
+    else:
+        text, conditions = FormatWeatherData(data)
+        conditions = bytearray(conditions)
+        if age is not None and age > CACHE_STALE_AFTER:
+            conditions += UTFToASCIIPosUA(f"; нет обновлений {FormatAge(age)}")
+            Log(f"ВНИМАНИЕ: данные устарели на {FormatAge(age)} (источник: {note})")
+        conditions = bytes(conditions)
+    with weather_lock:
+        weather_text_bytes, weather_conditions_bytes = text, conditions
+
+def ReadWeatherLines():
+    """Атомарный снимок обеих строк для потока дисплея."""
+    with weather_lock:
+        return weather_text_bytes, weather_conditions_bytes
+
+def NewScrollState():
+    return {'i_scroll': 0, 'fBegin': 0, 'floating': False, 'scroll_source': b'', 'scroll_head': b''}
+
+def NextBottomLine(state):
+    """Один кадр нижней строки (20 байт) для табло.
+
+    Содержимое прокрутки фиксируется при входе в режим бегущей строки. Иначе обновление
+    погоды посреди прокрутки меняет «эталон», условие выхода перестаёт выполняться,
+    fBegin уходит за конец scroll_source и нижняя строка навсегда остаётся пустой.
+    """
+    text_bytes, cond_bytes = ReadWeatherLines()   # один согласованный снимок на кадр
+
+    if state['floating']:
+        fBegin = state['fBegin']
+        rawL = state['scroll_source'][fBegin:20 + fBegin]
+        if not rawL or (fBegin > 10 and rawL.startswith(state['scroll_head'])):
+            state['floating'] = False
+            state['fBegin'] = 0
+            state['i_scroll'] = 0
+            return text_bytes.strip().ljust(20)
+        state['fBegin'] = fBegin + 1
+        return rawL.ljust(20)
+
+    state['i_scroll'] += 1
+    line = text_bytes.strip().ljust(20)
+    if state['i_scroll'] >= 200:
+        if len(cond_bytes) > 0:
+            state['floating'] = True
+            state['fBegin'] = 1
+            state['scroll_head'] = text_bytes.strip()
+            state['scroll_source'] = state['scroll_head'] + b'    ' + cond_bytes + b'     ' + state['scroll_head']
+        else:
+            state['i_scroll'] = 0
+    return line
+
+def SelfTest(ticks=30000, update_every=0.002):
+    """Прогон цикла вывода без железа: отдельный поток без пауз меняет строки в случайные моменты.
+
+    Смысл проверки: раньше обновление погоды посреди бегущей строки могло навсегда оставить
+    нижнюю строку пустой. Возвращает True, если залипаний не было.
+    """
+    global weather_text_bytes, weather_conditions_bytes
+    import random
+    rnd = random.Random(0)
+    stop = threading.Event()
+    switch_back = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)   # как можно чаще переключаем потоки, чтобы ловить гонку
+
+    def FakeWeather():
+        global weather_text_bytes, weather_conditions_bytes
+        i = 0
+        while not stop.is_set():
+            i += 1
+            text = f"T +{3 + i % 3}.{i % 10}C P7{i % 100:02d}mm H{i % 100}%".encode('ascii').ljust(20)
+            cond = bytes(UTFToASCIIPosUA(f"пасмурно; ветер западный, {2 + i % 5}.{i % 10} м/с"))
+            if i % 4 == 0:
+                cond += bytes(UTFToASCIIPosUA("; нет обновлений 4 ч"))
+            with weather_lock:
+                weather_text_bytes, weather_conditions_bytes = text, cond
+            if i % 50 == 0:
+                time.sleep(0)     # отдаём GIL, чтобы поток дисплея тоже поработал
+
+    worker = threading.Thread(target=FakeWeather, daemon=True)
+    worker.start()
+
+    state = NewScrollState()
+    blank_run = worst_blank_run = scrolls = 0
+    try:
+        for _ in range(ticks):
+            line = NextBottomLine(state)
+            if len(line) != 20:
+                Log(f"САМОТЕСТ: кадр длиной {len(line)} байт, ожидалось 20")
+                break
+            if line == b' ' * 20:
+                blank_run += 1
+                worst_blank_run = max(worst_blank_run, blank_run)
+            else:
+                blank_run = 0
+            if not state['floating'] and state['fBegin'] == 0 and state['i_scroll'] == 1:
+                scrolls += 1
+            if rnd.random() < 0.0005:
+                time.sleep(0)  # имитация задержки планировщика
+    finally:
+        stop.set()
+        worker.join(timeout=5)
+        sys.setswitchinterval(switch_back)
+
+    ok = worst_blank_run <= 30 and state['fBegin'] < 200
+    Log(f"САМОТЕСТ: кадров={ticks} прокруток={scrolls} макс. пустых кадров подряд={worst_blank_run} "
+        f"состояние={state['floating']}/{state['fBegin']} → {'OK' if ok else 'ПЛОХО'}")
+    return ok
 
 def WeatherWorker():
     fails = 0
@@ -423,13 +551,17 @@ def WeatherWorker():
         time.sleep(delay)
 
 if __name__ == '__main__':
+    if '--selftest' in sys.argv:
+        sys.exit(0 if SelfTest() else 1)
+
     if '--once' in sys.argv:
         # Диагностика: один цикл обновления, вывод того, что ушло бы на табло
         data, age, note, ok = UpdateOnce()
         ApplyToDisplay(data, age, note)
+        text, conditions = ReadWeatherLines()
         Log(f"ТЕСТ: источник={note} успешен={ok} возраст={FormatAge(age)}")
-        Log(f"ТЕСТ: строка1={bytes(weather_text_bytes)!r}")
-        Log(f"ТЕСТ: строка2={bytes(weather_conditions_bytes)!r}")
+        Log(f"ТЕСТ: строка1={bytes(text)!r}")
+        Log(f"ТЕСТ: строка2={bytes(conditions)!r}")
         sys.exit(0 if ok else 1)
 
     # Запуск потока обновления погоды
@@ -449,9 +581,7 @@ if __name__ == '__main__':
 
     open_port()
 
-    i_scroll = 0
-    fBegin = 0
-    floatingFlag = False
+    scroll_state = NewScrollState()
     last_port_try = time.time()
 
     while True:
@@ -460,27 +590,7 @@ if __name__ == '__main__':
         time_str = f"{days[now.weekday()]} {now.strftime('%d.%m.%y %H:%M:%S')}"
         hString = UTFToASCIIPosUA(time_str.ljust(20))
 
-        if floatingFlag:
-            clean_temp = weather_text_bytes.strip()
-            scroll_source = clean_temp + b'    ' + weather_conditions_bytes + b'     ' + clean_temp
-            rawL = scroll_source[fBegin:20+fBegin]
-            if fBegin > 10 and rawL.startswith(clean_temp):
-                floatingFlag = False
-                fBegin = 0
-                i_scroll = 0
-                lString = clean_temp.ljust(20)
-            else:
-                lString = rawL.ljust(20)
-                fBegin += 1
-        else:
-            i_scroll += 1
-            lString = weather_text_bytes.strip().ljust(20)
-            if i_scroll >= 200:
-                if len(weather_conditions_bytes) > 0:
-                    floatingFlag = True
-                    fBegin = 1
-                else:
-                    i_scroll = 0
+        lString = NextBottomLine(scroll_state)
 
         if port:
             try:
